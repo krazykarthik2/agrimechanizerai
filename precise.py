@@ -6,12 +6,36 @@ from shapely.geometry import box
 # --- 1. CONFIGURATION ---
 SERIAL_PORT = "/dev/ttyTHS1"
 BAUD_RATE = 9600
-T_FLUID_STOP_MS = 250 
+CONFIG_FILE = "fluid_config.txt"
 WINDOW_NAME = "Jetson Master Control - PRECISE"
 INPUT_W, INPUT_H = 640, 480 
 CANVAS_W, CANVAS_H = 1280, 480
 CAM_A_ID = "/dev/v4l/by-id/usb-Ingenic_Semiconductor_Co._Ltd_HD_Web_Camera_1234567890-video-index0"
 CAM_B_ID = "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_Camera_SN0001-video-index0"
+
+
+
+def load_fluid_delay():
+    try:
+        if not os.path.exists(CONFIG_FILE):
+            raise FileNotFoundError(f"Missing {CONFIG_FILE}")
+        
+        with open(CONFIG_FILE, "r") as f:
+            value = f.read().strip()
+            if not value:
+                raise ValueError("Fluid config file is empty")
+            return int(value)
+            
+    except Exception as e:
+        # Create a fatal error screen if the config is missing or broken
+        error_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(error_img, "FATAL: CONFIG ERROR", (50, 200), 1, 2, (0, 0, 255), 3)
+        cv2.putText(error_img, str(e), (50, 260), 1, 1, (255, 255, 255), 1)
+        cv2.imshow("CRITICAL ERROR", error_img)
+        cv2.waitKey(0) # Block forever until user kills process
+        sys.exit(f"System Halted: {e}")
+
+T_FLUID_STOP_MS = load_fluid_delay()
 
 # --- 2. LAZY LOADED MODELS ---
 # We use globals but initialize them to None to save memory/power at boot
@@ -95,15 +119,51 @@ def on_mouse_click(event, x, y, flags, param):
                 if water_btn[0] < sx < water_btn[0]+btn_w: state = 'GREEN'
                 elif fert_btn[0] < sx < fert_btn[0]+btn_w: state = 'HUMAN'
                 elif calib_btn[0] < sx < calib_btn[0]+btn_w:
+                    print("Stopping pumps for calibration...")
+                    if ser:
+                        ser.write(b";a,0;;b,0;\n") # Force pumps OFF
+                        ser.close()
+                    # 1. RELEASE RESOURCES
+                    print("Releasing hardware for calibration...")
+                    cap_l.release()
+                    cap_r.release()
+                    if ser:
+                        ser.close()
+                    
+                    cv2.destroyAllWindows() # Close the main UI
+
+                    # 2. HANDOVER CONTROL
+                    # This line blocks 'precise.py' until the calibration script is closed
                     subprocess.run(["python3", "calibrate_wiper2.py"])
-                    predictors['left'], predictors['right'] = WiperPredictor('left'), WiperPredictor('right')
+
+                    # 3. RE-ACQUIRE RESOURCES
+                    print("Calibration finished. Re-acquiring hardware...")
+                    
+                    # Re-open Serial
+                    try:
+                        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+                    except:
+                        ser = None
+                    
+                    # Re-open Cameras
+                    cap_l = cv2.VideoCapture(get_video_index(CAM_A_ID))
+                    cap_r = cv2.VideoCapture(get_video_index(CAM_B_ID))
+                    
+                    # Re-load Predictions (The 'Lazy Loading' update)
+                    predictors['left'] = WiperPredictor('left')
+                    predictors['right'] = WiperPredictor('right')
+                    T_FLUID_STOP_MS = load_fluid_delay()
+                    
+
+                    # Re-create Main Window
+                    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+                    cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
+                    
         if back_btn[1] < sy < back_btn[1]+40 and back_btn[0] < sx < back_btn[0]+120:
             state = 'DEPTH'
 
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
-
-
 
 cap_l = cv2.VideoCapture(get_video_index(CAM_A_ID), cv2.CAP_V4L2)
 cap_r = cv2.VideoCapture(get_video_index(CAM_B_ID), cv2.CAP_V4L2)
@@ -147,21 +207,41 @@ while True:
                     if net.GetClassDesc(d.ClassID) == 'person':
                         if box(d.Left, d.Top, d.Right, d.Bottom).intersects(vicinity):
                             hit = True; break
-            
+                            
+                            
             elif state == 'GREEN':
-                # --- GREEN COLOR LOGIC ---
+                # --- GREEN COLOR LOGIC WITH HYSTERESIS ---
                 roi = frame[max(0, py-25):min(INPUT_H, py+25), max(0, px-25):min(INPUT_W, px+25)]
+                
+                is_green_now = False
                 if roi.size > 0:
-                    mask = cv2.inRange(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), (35, 40, 40), (85, 255, 255))
-                    hit = cv2.countNonZero(mask) > (roi.size * 0.15)
+                    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                    mask = cv2.inRange(hsv_roi, (35, 40, 40), (85, 255, 255))
+                    # If more than 15% of the vicinity is green, it's a 'hit' for this frame
+                    is_green_now = cv2.countNonZero(mask) > (roi.size * 0.15)
 
-            if ser: ser.write(f";{prefix},{'0' if hit else '90'};\n".encode())
-            cv2.circle(frame, (px, py), 12, (0, 0, 255) if hit else (0, 255, 0), -1)
+                # Update history buffer
+                green_history[side].append(is_green_now)
+                if len(green_history[side]) > GREEN_BUFFER_SIZE:
+                    green_history[side].pop(0)
+
+                # HYSTERESIS DECISION:
+                # We only change the 'hit' status if the buffer is consistently one way.
+                # Requirement: 3 out of 5 frames must agree to change state.
+                if sum(green_history[side]) >= 3:
+                    hit = True
+                elif sum(green_history[side]) <= 1:
+                    hit = False
+                else:
+                    # Keep previous 'hit' state to prevent chattering
+                    # (Note: 'hit' is initialized to False at the start of the 'for' loop, 
+                    # so you might need to persist 'hit' in a global if you want true sticky behavior)
+                    pass
 
     # Rendering
     canvas = np.hstack((out_l, out_r))
     if state == 'DEPTH':
-        for b, txt, col in [(water_btn, "WATER", (0,160,0)), (fert_btn, "FERT", (0,0,160)), (calib_btn, "CALIB", (160,0,0))]:
+        for b, txt, col in [(water_btn, "WATER", (0,160,0)), (fert_btn, "FERT", (0,0,160)), (calib_btn, "CALIBr8", (160,0,0))]:
             cv2.rectangle(canvas, (b[0], b[1]), (b[0]+btn_w, b[1]+btn_h), col, -1)
             cv2.putText(canvas, txt, (b[0]+50, b[1]+55), 1, 2, (255,255,255), 3)
     else:

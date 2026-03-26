@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import random
 import sys
+import os
 import serial  # Requires: pip install pyserial
 
 # --- 1. SERIAL CONFIGURATION ---
@@ -49,6 +50,11 @@ buttons = {
 btn_triggered = None
 arc_pixels = []
 serial_buffer = ""
+current_delay = 250
+
+def on_delay_change(val):
+    global current_delay
+    current_delay = val
 
 def click_event(event, x, y, flags, param):
     global arc_pixels, btn_triggered
@@ -92,10 +98,18 @@ def parse_serial_stream(side_name, current_min, current_max):
     return current_min, current_max
 
 def run_calibration(cam_index, side_name):
-    global arc_pixels, btn_triggered, swap_extremes
+    global arc_pixels, btn_triggered, swap_extremes, current_delay
     arc_pixels = []
     swap_extremes = False
     btn_triggered = None
+
+    # Initialize slider value from file if it exists.
+    if os.path.exists("fluid_config.txt"):
+        try:
+            with open("fluid_config.txt", "r") as f:
+                current_delay = int(f.read().strip())
+        except Exception:
+            pass
     
     stream_min = float('inf')
     stream_max = float('-inf')
@@ -104,6 +118,7 @@ def run_calibration(cam_index, side_name):
     win_name = f"Calibration - {side_name.upper()}"
     cv2.namedWindow(win_name)
     cv2.setMouseCallback(win_name, click_event)
+    cv2.createTrackbar("Fluid Delay (ms)", win_name, current_delay, 5000, on_delay_change)
 
     while True:
         ret, frame = cap.read()
@@ -118,6 +133,7 @@ def run_calibration(cam_index, side_name):
 
         # Draw UI Elements
         cv2.rectangle(canvas, (0, h), (w, h+100), (30, 30, 30), -1)
+        cv2.putText(canvas, f"DELAY: {current_delay}ms", (w-200, 40), 1, 1.2, (255, 200, 0), 2)
         for name, (x1, y1, x2, y2) in buttons.items():
             cv2.rectangle(canvas, (x1, y1), (x2, y2), (60, 60, 60), -1)
             cv2.rectangle(canvas, (x1, y1), (x2, y2), (200, 200, 200), 2)
@@ -163,6 +179,9 @@ def run_calibration(cam_index, side_name):
         elif btn_triggered == "SAVE" and len(arc_pixels) >= 3:
             with open(f"{side_name}_calibration.txt", "w") as f:
                 f.write(f"{xc},{yc},{r},{start_a},{end_a},{t_display_min},{t_display_max}")
+            with open("fluid_config.txt", "w") as f:
+                f.write(str(current_delay))
+            print(f"Saved! Delay set to {current_delay}ms")
             btn_triggered = None
             break
         elif btn_triggered == "QUIT":
