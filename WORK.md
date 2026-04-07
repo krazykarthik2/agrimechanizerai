@@ -1,4 +1,4 @@
-main.py contains script that is stable and independent of other python scripts other scripts are test
+UIworking.py contains script that is stable and independent of other python scripts other scripts are test
 
 precise.py is the new script that will be osciallation aware and calculate the next ones and then predict the next step and control sprayers
 

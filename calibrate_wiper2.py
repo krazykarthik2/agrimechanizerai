@@ -9,12 +9,35 @@ import serial  # Requires: pip install pyserial
 # Using your specified Orin port and baud rate
 SERIAL_PORT = "/dev/ttyTHS1"
 BAUD_RATE = 9600
+TARGET_HEIGHT = 480  # Standard output height
 
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0) # timeout=0 makes it non-blocking
 except Exception as e:
     print(f"Serial Error: {e}. Check permissions or connections.")
     ser = None
+
+# --- SCALING UTILITIES ---
+def scale_frame_to_height(frame, target_height=TARGET_HEIGHT):
+    """Scale frame to target height while maintaining aspect ratio."""
+    h, w = frame.shape[:2]
+    scale = target_height / h
+    new_w = int(w * scale)
+    return cv2.resize(frame, (new_w, target_height)), scale
+
+def normalize_coordinates(xc, yc, r, frame_width, frame_height):
+    """Normalize circle parameters to 0-1 range."""
+    norm_xc = xc / frame_width
+    norm_yc = yc / frame_height
+    norm_r = r / np.sqrt(frame_width**2 + frame_height**2)  # Diagonal-based normalization
+    return norm_xc, norm_yc, norm_r
+
+def denormalize_coordinates(norm_xc, norm_yc, norm_r, frame_width, frame_height):
+    """Convert normalized coordinates back to pixel space."""
+    xc = norm_xc * frame_width
+    yc = norm_yc * frame_height
+    r = norm_r * np.sqrt(frame_width**2 + frame_height**2)
+    return xc, yc, r
 
 # --- 2. CORE RANSAC LOGIC ---
 def get_circle_3p(p1, p2, p3):
@@ -51,20 +74,24 @@ btn_triggered = None
 arc_pixels = []
 serial_buffer = ""
 current_delay = 250
+scale_factor = 1.0  # Global scale factor for coordinate conversion
 
 def on_delay_change(val):
     global current_delay
     current_delay = val
 
 def click_event(event, x, y, flags, param):
-    global arc_pixels, btn_triggered
+    global arc_pixels, btn_triggered, scale_factor
     if event == cv2.EVENT_LBUTTONDOWN:
         for name, (x1, y1, x2, y2) in buttons.items():
             if x1 <= x <= x2 and y1 <= y <= y2:
                 btn_triggered = name
                 return
-        if y < 480: 
-            arc_pixels.append((x, y))
+        # Scale click coordinates to original frame space
+        scaled_y = int(y / scale_factor)
+        scaled_x = int(x / scale_factor)
+        if scaled_y < int(480 / scale_factor):  # Within frame region
+            arc_pixels.append((scaled_x, scaled_y))
 
 def parse_serial_stream(side_name, current_min, current_max):
     """
@@ -177,11 +204,36 @@ def run_calibration(cam_index, side_name):
             stream_min, stream_max = float('inf'), float('-inf')
             btn_triggered = None
         elif btn_triggered == "SAVE" and len(arc_pixels) >= 3:
+            # 1. Get current frame dimensions for normalization
+            h, w = frame.shape[:2]
+
+            # 2. Extract circle params from RANSAC result
+            xc, yc, r = result
+
+            # 3. Normalize parameters (0.0 to 1.0 scale)
+            # Center coordinates normalized by width and height
+            norm_xc = xc / w
+            norm_yc = yc / h
+
+            # Radius normalized by the frame diagonal (standardizes scale)
+            diag = np.sqrt(w**2 + h**2)
+            norm_r = r / diag
+
+            # 4. Angles (theta) are already scale-invariant (radians),
+            # so we save start_a and end_a as they are.
+
+            # 5. Save to the text file
             with open(f"{side_name}_calibration.txt", "w") as f:
-                f.write(f"{xc},{yc},{r},{start_a},{end_a},{t_display_min},{t_display_max}")
+                # Format: xc,yc,r,theta_start,theta_end,stream_min,stream_max
+                f.write(f"{norm_xc},{norm_yc},{norm_r},{start_a},{end_a},{t_display_min},{t_display_max}")
+
+            # Save the fluid delay separately
             with open("fluid_config.txt", "w") as f:
                 f.write(str(current_delay))
-            print(f"Saved! Delay set to {current_delay}ms")
+
+            print(f"Saved Normalized {side_name.upper()} Params!")
+            print(f"Pos: ({norm_xc:.4f}, {norm_yc:.4f}), Rad: {norm_r:.4f}")
+
             btn_triggered = None
             break
         elif btn_triggered == "QUIT":
@@ -194,7 +246,15 @@ def run_calibration(cam_index, side_name):
     cap.release()
     cv2.destroyWindow(win_name)
 
+CAM_RIGHT_ID = "/dev/v4l/by-id/usb-Ingenic_Semiconductor_Co._Ltd_HD_Web_Camera_1234567890-video-index0"
+CAM_LEFT_ID = "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_Camera_SN0001-video-index0"
+
+def get_video_index(path):
+    if not os.path.exists(path): return None
+    return int(''.join(filter(str.isdigit, os.path.realpath(path).split('/')[-1])))
+
 if __name__ == "__main__":
-    run_calibration(0, "left")
-    run_calibration(1, "right")
+    run_calibration(get_video_index(CAM_LEFT_ID), "left")
+    run_calibration(get_video_index(CAM_RIGHT_ID), "right")
+    
     if ser: ser.close()
